@@ -11,8 +11,9 @@ endif()
 
 add_compile_options($<$<CONFIG:Debug>:-fsanitize=address,undefined>)
 add_link_options($<$<CONFIG:Debug>:-fsanitize=address,undefined>)
+add_compile_definitions($<$<CONFIG:Debug>:EIGEN_INITIALIZE_MATRICES_BY_NAN>)
 
-set(UAV_WARNINGS -Wall -Wextra -Wpedantic)
+set(UAV_WARNINGS -Wall -Wextra -Wpedantic -Werror)
 
 find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(raylib REQUIRED)
@@ -20,6 +21,7 @@ find_package(raylib REQUIRED)
 
 add_library(uav_core STATIC
   src/frames.cpp
+  src/dynamics.cpp
 )
 target_include_directories(uav_core PUBLIC include)
 target_link_libraries(uav_core PUBLIC Eigen3::Eigen)
@@ -35,3 +37,9 @@ target_compile_options(uav_render PRIVATE ${UAV_WARNINGS})
 add_executable(uav_sim src/main.cpp)
 target_link_libraries(uav_sim PRIVATE uav_render)
 target_compile_options(uav_sim PRIVATE ${UAV_WARNINGS})
+
+enable_testing()
+add_executable(uav_tests tests/test_main.cpp)
+target_link_libraries(uav_tests PRIVATE uav_core)
+target_compile_options(uav_tests PRIVATE ${UAV_WARNINGS})
+add_test(NAME uav_tests COMMAND uav_tests)
