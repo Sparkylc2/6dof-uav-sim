@@ -1,0 +1,5 @@
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    - -isystem/opt/homebrew/include/eigen3
+    - -isystem/opt/homebrew/include
