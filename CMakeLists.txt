@@ -21,10 +21,12 @@ find_package(raylib REQUIRED)
 
 add_library(uav_core STATIC
   src/frames.cpp
-  src/dynamics.cpp
+  src/force_models.cpp
+  src/body.cpp
+  src/body_system.cpp
 )
 target_include_directories(uav_core PUBLIC include)
-target_link_libraries(uav_core PUBLIC Eigen3::Eigen)
+target_link_libraries(uav_core PUBLIC Eigen3::Eigen PRIVATE raylib)
 target_compile_options(uav_core PRIVATE ${UAV_WARNINGS})
 
 add_library(uav_render STATIC

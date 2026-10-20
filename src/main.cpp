@@ -1,7 +1,9 @@
 // src/main.cpp
-#include "dynamics.hpp"
+#include "body.hpp"
+#include "body_system.hpp"
 #include "frames.hpp"
 #include "render/render.hpp"
+#include "state.hpp"
 #include <Eigen/Dense>
 #include <cmath>
 #include <raylib.h>
@@ -12,86 +14,34 @@ int main() {
 
     uav::rendering::init_rendering();
     uav::rendering::init_camera({-10.0, -6.0, -6.0}, {0, 0, 0}, {0, 0, -1}, 45.0);
-    Mesh mesh = GenMeshCube(0.5f, 0.5f, 0.5f);
+    Mesh mesh = GenMeshCube(0.25, 0.25, 0.25f);
+
     Model model = LoadModelFromMesh(mesh);
 
-    uav::Body *body = generate_zagi_flying_wing();
-
-    auto forces = [](uav::Body *b, double) -> Eigen::Vector3d {
-        Eigen::Vector3d g = {0, 0, b->m * 9.81};
-        Eigen::Matrix3d R_grav = rotation(b->r.x(), b->r.y(), b->r.z());
-        Vector3d f = R_grav * g;
-
-        double mult = 2.0 * b->m * 9.81;
-        if (IsKeyDown(KEY_RIGHT_SHIFT)) {
-            mult *= 1.2;
-        }
-
-        if (IsKeyDown(KEY_SPACE)) {
-            f += Vector3d(0.0, 0.0, -mult);
-        }
-        if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            f += Vector3d(0.0, 0.0, mult);
-        }
-
-        return f;
-    };
-
-    auto moments = [](uav::Body *, double) -> Eigen::Vector3d {
-        Vector3d T = Vector3d::Zero();
-
-        double mult = 0.5;
-
-        if (IsKeyDown(KEY_RIGHT_SHIFT)) {
-            mult *= 1.2;
-        }
-        if (IsKeyDown(KEY_W)) {
-            T.y() -= mult;
-        }
-        if (IsKeyDown(KEY_S)) {
-            T.y() += mult;
-        }
-        if (IsKeyDown(KEY_A)) {
-            T.x() -= mult;
-        }
-        if (IsKeyDown(KEY_D)) {
-            T.x() += mult;
-        }
-        if (IsKeyDown(KEY_Q)) {
-            T.z() -= mult;
-        }
-        if (IsKeyDown(KEY_E)) {
-            T.z() += mult;
-        }
-
-        return T;
-    };
-
-    body->get_forces = forces;
-    body->get_moments = moments;
-
     uav::BodySystem sys;
-    sys.bodies.push_back(body);
+    auto drone = std::make_unique<uav::Drone>();
+    uav::Drone &body = *drone;
+    sys.bodies.push_back(std::move(drone));
 
     while (!WindowShouldClose()) {
         if (IsKeyPressed(KEY_R)) {
-            body->reset();
+            body.state = uav::State();
         }
         if (IsKeyPressed(KEY_F)) {
             first_person = !first_person;
         }
+        body.read_keyboard();
         const double dt = GetFrameTime();
         sys.step(dt);
-        const Eigen::Matrix3d R_b2i =
-            uav::rotation(body->r.x(), body->r.y(), body->r.z()).transpose();
+        const Eigen::Matrix3d R_b2i = rotation(body.state.quat());
 
-        Matrix transform = rendering::to_rl_transform(R_b2i, body->p);
+        Matrix transform = rendering::to_rl_transform(R_b2i, body.state.pos());
         model.transform = transform;
 
         if (first_person) {
-            rendering::CAMERA.position = rendering::ned_to_rl(body->p);
+            rendering::CAMERA.position = rendering::ned_to_rl(body.state.pos());
             rendering::CAMERA.target =
-                rendering::ned_to_rl(body->p + R_b2i * Vector3d(1.0, 0.0, 0.0));
+                rendering::ned_to_rl(body.state.pos() + R_b2i * Vector3d(1.0, 0.0, 0.0));
             rendering::CAMERA.up = rendering::ned_to_rl(R_b2i * Vector3d(0.0, 0.0, -1.0));
             rendering::CAMERA.fovy = 90.0f;
         } else {
