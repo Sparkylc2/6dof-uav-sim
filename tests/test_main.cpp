@@ -1,12 +1,17 @@
 #include "body.hpp"
 #include "body_system.hpp"
+#include "force_models/fixed_wing_model.hpp"
 #include "frames.hpp"
+#include "world.hpp"
 #include <cmath>
 #include <cstdio>
 #include <functional>
 #include <memory>
 #include <numbers>
 #include <random>
+
+// moving forward i'm having claude generate the tests, in the interest of time
+// however, i do go through the tests, and some of them are my own suggestions
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -56,15 +61,15 @@ static Eigen::Matrix3d inertia_matrix(const Eigen::Vector4d &I) {
 // a body with the zagi's mass properties whose forces and moments are set by each test
 // (no gravity unless a test adds it)
 struct TestBody : uav::Body {
-    std::function<Eigen::Vector3d(const uav::Body &, const uav::State &)> get_forces;
-    std::function<Eigen::Vector3d(const uav::Body &, const uav::State &)> get_moments;
+    std::function<Eigen::Vector3d(const uav::Body &, const uav::BodyState &)> get_forces;
+    std::function<Eigen::Vector3d(const uav::Body &, const uav::BodyState &)> get_moments;
 
     TestBody() {
         m = 1.56;
         I << 0.1147, 0.0576, 0.1712, 0.0015;
     }
 
-    uav::Wrench wrench(const uav::State &x) const override {
+    uav::Wrench wrench(const uav::BodyState &x, const uav::AirState &) const override {
         uav::Wrench w;
         if (get_forces)
             w.F = get_forces(*this, x);
@@ -174,7 +179,7 @@ static void test_quat_rate_matches_euler_rates() {
 static void test_constant_force_gives_linear_velocity() {
     auto sys = make_zagi_system();
     const double a = 2.0;
-    test_body(sys).get_forces = [a](const uav::Body &body, const uav::State &) {
+    test_body(sys).get_forces = [a](const uav::Body &body, const uav::BodyState &) {
         return Eigen::Vector3d(body.m * a, 0, 0);
     };
 
@@ -255,7 +260,7 @@ static void test_roll_yaw_coupling() {
         auto sys = make_zagi_system();
         TestBody &b = test_body(sys);
         b.I.w() = Ixz;
-        b.get_moments =[](const uav::Body &, const uav::State &) {
+        b.get_moments = [](const uav::Body &, const uav::BodyState &) {
             return Eigen::Vector3d(0.1, 0, 0);
         };
 
@@ -329,13 +334,226 @@ static void test_pitch_through_vertical() {
 static void test_drone_gravity_only() {
     const uav::Drone d;
 
-    const uav::Wrench level = d.wrench(uav::State());
+    const uav::Wrench level = d.wrench(uav::BodyState(), {});
     CHECK_VEC_NEAR(level.F, Eigen::Vector3d(0, 0, d.m * 9.81), 1e-12);
     CHECK_VEC_NEAR(level.M, Eigen::Vector3d::Zero(), 1e-15);
 
-    uav::State pitched;
+    uav::BodyState pitched;
     pitched.quat() = uav::euler_to_quat(0, pi / 2, 0);
-    CHECK_VEC_NEAR(d.wrench(pitched).F, Eigen::Vector3d(-d.m * 9.81, 0, 0), 1e-12);
+    CHECK_VEC_NEAR(d.wrench(pitched, {}).F, Eigen::Vector3d(-d.m * 9.81, 0, 0), 1e-12);
+}
+
+// ---- fixed wing force models ----
+// air data in still air with the body level, so the ground velocity is the air velocity
+static uav::AirData still_air_data(const Eigen::Vector3d &vel_b) {
+    return uav::air_data(vel_b, Eigen::Vector4d(1, 0, 0, 0), uav::AirState());
+}
+
+// forward along x gives no alpha or beta, tilting the velocity down body z gives alpha, and at rest
+// everything is 0 (not nan)
+static void test_air_data() {
+    const uav::AirData fwd = still_air_data(Eigen::Vector3d(10, 0, 0));
+    CHECK_NEAR(fwd.Va, 10.0, 1e-12);
+    CHECK_NEAR(fwd.alpha, 0.0, 1e-15);
+    CHECK_NEAR(fwd.beta, 0.0, 1e-15);
+
+    const uav::AirData pitched = still_air_data(Eigen::Vector3d(10, 0, 10 * std::tan(0.1)));
+    CHECK_NEAR(pitched.alpha, 0.1, 1e-12);
+
+    const uav::AirData slipping = still_air_data(Eigen::Vector3d(10, 10 * std::tan(0.2), 0));
+    CHECK_NEAR(slipping.beta, 0.2, 1e-12);
+
+    const uav::AirData rest = still_air_data(Eigen::Vector3d::Zero());
+    CHECK(rest.Va == 0.0 && rest.alpha == 0.0 && rest.beta == 0.0);
+}
+
+// well below stall the blended lift is the linear lift, past stall it drops off
+static void test_lift_stall() {
+    const uav::FixedWingParams p = uav::generate_zagi_flying_wing().params;
+
+    for (const double alpha : {-0.1, 0.0, 0.05, 0.15})
+        CHECK_NEAR(uav::lift_coefficient(p, alpha), p.CL0 + p.CL_alpha * alpha, 1e-6);
+
+    CHECK(uav::lift_coefficient(p, 0.7) < uav::lift_coefficient(p, 0.3));
+}
+
+// well below stall the blended drag is the polar, well past stall it's the flat plate drag
+static void test_drag_stall() {
+    const uav::FixedWingParams p = uav::generate_zagi_flying_wing().params;
+    const double AR = p.b * p.b / p.S;
+
+    for (const double alpha : {-0.1, 0.0, 0.05, 0.15}) {
+        const double CL = p.CL0 + p.CL_alpha * alpha;
+        CHECK_NEAR(uav::drag_coefficient(p, alpha), p.CD_p + CL * CL / (pi * p.e * AR), 1e-6);
+    }
+
+    for (const double alpha : {-1.2, 1.2, pi / 2}) {
+        const double s = std::sin(alpha);
+        CHECK_NEAR(uav::drag_coefficient(p, alpha), 2.0 * s * s * std::abs(s), 1e-6);
+    }
+}
+
+// longitudinal force at q = de = 0 has to be lift and drag rotated by alpha
+static void test_longitudinal_is_rotated_lift_drag() {
+    const uav::FixedWingParams p = uav::generate_zagi_flying_wing().params;
+    const double alpha = 0.12;
+    const uav::AirData air{15.0, alpha, 0.0};
+
+    const double qbar_S = 0.5 * air.rho * air.Va * air.Va * p.S;
+    const double L = qbar_S * uav::lift_coefficient(p, alpha);
+    const double D = qbar_S * uav::drag_coefficient(p, alpha);
+
+    const uav::Wrench w = uav::longitudinal_aero(p, air, 0.0, 0.0);
+    CHECK_NEAR(w.F.x(), -D * std::cos(alpha) + L * std::sin(alpha), 1e-12);
+    CHECK_NEAR(w.F.z(), -D * std::sin(alpha) - L * std::cos(alpha), 1e-12);
+    CHECK(w.F.z() < 0.0); // lift points up (-d)
+}
+
+// cm_alpha < 0 so more alpha should pitch the nose back down (static stability)
+static void test_pitch_stability() {
+    const uav::FixedWingParams p = uav::generate_zagi_flying_wing().params;
+    const double m0 = uav::longitudinal_aero(p, {15.0, 0.0, 0.0}, 0.0, 0.0).M.y();
+    const double m1 = uav::longitudinal_aero(p, {15.0, 0.1, 0.0}, 0.0, 0.0).M.y();
+    CHECK(m1 < m0);
+}
+
+// with no sideslip, roll or yaw rate, aileron or rudder there's nothing lateral
+static void test_lateral_symmetry() {
+    const uav::FixedWingParams p = uav::generate_zagi_flying_wing().params;
+    const uav::Wrench w = uav::lateral_aero(p, {15.0, 0.1, 0.0}, Eigen::Vector3d(0, 0.3, 0), 0, 0);
+    CHECK_VEC_NEAR(w.F, Eigen::Vector3d::Zero(), 1e-15);
+    CHECK_VEC_NEAR(w.M, Eigen::Vector3d::Zero(), 1e-15);
+}
+
+// static thrust is 1/2 rho S_prop C_prop k_motor^2 dt^2 and it hits zero when Va = k_motor dt
+static void test_propulsion() {
+    const uav::FixedWingParams p = uav::generate_zagi_flying_wing().params;
+    const uav::AirData rest{0.0, 0.0, 0.0};
+    CHECK_NEAR(uav::propulsion(p, rest, 1.0).F.x(),
+               0.5 * rest.rho * p.S_prop * p.C_prop * p.k_motor * p.k_motor, 1e-12);
+    CHECK_NEAR(uav::propulsion(p, {0.5 * p.k_motor, 0.0, 0.0}, 0.5).F.x(), 0.0, 1e-12);
+}
+
+// at rest (even spinning) the zagi only feels gravity, and nothing is nan
+static void test_zagi_at_rest_is_gravity_only() {
+    uav::FixedWing zagi = uav::generate_zagi_flying_wing();
+    zagi.state.rates() = Eigen::Vector3d(1.0, -0.5, 0.3);
+    zagi.controls = {0.1, -0.1, 0.0, 0.0};
+
+    const uav::Wrench w = zagi.wrench(zagi.state, {});
+    CHECK_VEC_NEAR(w.F, Eigen::Vector3d(0, 0, zagi.m * 9.81), 1e-12);
+    CHECK_VEC_NEAR(w.M, Eigen::Vector3d::Zero(), 1e-12);
+}
+
+// flying it through the rk4 for a few seconds shouldn't blow up
+static void test_zagi_flies_without_nan() {
+    uav::BodySystem sys;
+    auto zagi = std::make_unique<uav::FixedWing>(uav::generate_zagi_flying_wing());
+    zagi->state.vel() = Eigen::Vector3d(15.0, 0, 0);
+    zagi->controls.dt = 0.8;
+    uav::FixedWing &b = *zagi;
+    sys.bodies.push_back(std::move(zagi));
+
+    for (int i = 0; i < 3000; ++i)
+        sys.step(1e-3);
+
+    CHECK(b.state.state.allFinite());
+}
+
+// ---- wind ----
+// the wind is taken off the ground velocity, steady wind rotated into the body and gusts as they
+// are
+static void test_air_data_with_wind() {
+    // flying north at 10 m/s ground speed into a 5 m/s headwind (wind blowing south) is 15 m/s
+    // airspeed
+    uav::AirState head;
+    head.wind_i = Eigen::Vector3d(-5, 0, 0);
+    const Eigen::Vector4d level(1, 0, 0, 0);
+    CHECK_NEAR(uav::air_data(Eigen::Vector3d(10, 0, 0), level, head).Va, 15.0, 1e-12);
+
+    // yawed 90 deg (nose east) the same wind comes from the left (north), so relative to the air
+    // the body is slipping left (v_r < 0) and beta < 0
+    const Eigen::Vector4d east = uav::euler_to_quat(0, 0, pi / 2);
+    const uav::AirData cross = uav::air_data(Eigen::Vector3d(10, 0, 0), east, head);
+    CHECK_NEAR(cross.Va, std::sqrt(125.0), 1e-12);
+    CHECK_NEAR(cross.beta, -std::atan2(5.0, 10.0), 1e-12);
+
+    // an upward gust in body z (w_g < 0) gives the wing more alpha
+    uav::AirState gust;
+    gust.gust_b = Eigen::Vector3d(0, 0, -1.0);
+    CHECK_NEAR(uav::air_data(Eigen::Vector3d(10, 0, 0), level, gust).alpha, std::atan2(1.0, 10.0),
+               1e-12);
+
+    // density is passed straight through
+    uav::AirState thin;
+    thin.rho = 1.0;
+    CHECK_NEAR(uav::air_data(Eigen::Vector3d(10, 0, 0), level, thin).rho, 1.0, 0.0);
+}
+
+// the standard deviation of each gust channel over a long run
+static Eigen::Vector3d gust_std(double Va, double dt, double T) {
+    uav::DrydenGust g;
+    std::mt19937 rng(1);
+    const int n = static_cast<int>(T / dt);
+    Eigen::Vector3d sum = Eigen::Vector3d::Zero(), sum_sq = Eigen::Vector3d::Zero();
+    for (int i = 0; i < n; ++i) {
+        const Eigen::Vector3d x = g.step(Va, dt, rng);
+        sum += x;
+        sum_sq += x.cwiseProduct(x);
+    }
+    const Eigen::Vector3d mean = sum / n;
+    return (sum_sq / n - mean.cwiseProduct(mean)).cwiseSqrt();
+}
+
+// the dryden filters are normalised so each gust comes out with rms sigma, and the sqrt(dt) noise
+// scaling means that doesn't change with the step size
+// (10000 s is about 1000 correlation times for u, so the estimate is good to a few percent)
+static void test_dryden_gust_rms() {
+    const uav::DrydenParams p;
+    const Eigen::Vector3d sigma(p.sigma_u, p.sigma_v, p.sigma_w);
+    for (const double dt : {0.02, 0.01})
+        CHECK_VEC_NEAR(gust_std(20.0, dt, 10000.0).cwiseQuotient(sigma), Eigen::Vector3d::Ones(),
+                       0.08);
+}
+
+// with turbulence off and no wind the world has to fly the exact same trajectory as the bodies
+// stepping on their own
+static void test_world_calm_matches_body_system() {
+    auto make_zagi = []() {
+        auto z = std::make_unique<uav::FixedWing>(uav::generate_zagi_flying_wing());
+        z->state.vel() = Eigen::Vector3d(15.0, 0, 0);
+        z->controls = {-0.1, 0.02, 0.0, 0.8};
+        return z;
+    };
+
+    uav::BodySystem sys;
+    sys.bodies.push_back(make_zagi());
+    uav::World world;
+    world.atmosphere.turbulence = false;
+    world.bodies.bodies.push_back(make_zagi());
+
+    for (int i = 0; i < 2000; ++i) {
+        sys.step(1e-3);
+        world.step(1e-3);
+    }
+
+    CHECK((sys.bodies[0]->state.state - world.bodies.bodies[0]->state.state).norm() == 0.0);
+}
+
+// with turbulence on the world still flies without nans, and actually gets bumped around
+static void test_world_turbulent_flight() {
+    uav::World world;
+    auto zagi = std::make_unique<uav::FixedWing>(uav::generate_zagi_flying_wing());
+    zagi->state.vel() = Eigen::Vector3d(15.0, 0, 0);
+    zagi->controls.dt = 0.8;
+    uav::FixedWing &b = *zagi;
+    world.bodies.bodies.push_back(std::move(zagi));
+
+    for (int i = 0; i < 3000; ++i)
+        world.step(1e-3);
+
+    CHECK(b.state.state.allFinite());
+    CHECK(b.air.gust_b.norm() > 0.0);
 }
 
 int main() {
@@ -355,6 +573,19 @@ int main() {
     test_quat_stays_unit();
     test_pitch_through_vertical();
     test_drone_gravity_only();
+    test_air_data();
+    test_lift_stall();
+    test_drag_stall();
+    test_longitudinal_is_rotated_lift_drag();
+    test_pitch_stability();
+    test_lateral_symmetry();
+    test_propulsion();
+    test_zagi_at_rest_is_gravity_only();
+    test_zagi_flies_without_nan();
+    test_air_data_with_wind();
+    test_dryden_gust_rms();
+    test_world_calm_matches_body_system();
+    test_world_turbulent_flight();
 
     std::printf("%d/%d passed\n (pray its all right xD)", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;

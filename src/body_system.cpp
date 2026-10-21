@@ -3,7 +3,7 @@
 
 namespace uav {
 
-StateVector BodySystem::derivatives(const Body &b, const State &x, const Vector3d &F,
+StateVector BodySystem::derivatives(const Body &b, const BodyState &x, const Vector3d &F,
                                     const Vector3d &T) {
     // the resulting system derivative
     StateVector x_dot;
@@ -70,17 +70,18 @@ void BodySystem::step(double dt) {
         Body &b = *body;
 
         // slope of the state at x (current state), with the forces and moments evaluated at x
-        // itself
-        auto f = [this, &b](const State &x) {
-            const Wrench w = b.wrench(x);
+        auto f = [this, &b](const BodyState &x) {
+            // the air is held for the whole step, but the steady wind still gets rotated by each
+            // stage's attitude inside the wrench
+            const Wrench w = b.wrench(x, b.air);
             return derivatives(b, x, w.F, w.M);
         };
 
         // --- rk4 ---
         // the state at the start of the step
-        const State &x0 = b.state;
+        const BodyState &x0 = b.state;
         auto offset = [&x0](const StateVector &k, double h) {
-            State x = x0;
+            BodyState x = x0;
             x.state += h * k;
             return x;
         };

@@ -22,7 +22,7 @@ void begin() {
     BeginDrawing();
     ClearBackground(RAYWHITE);
     BeginMode3D(CAMERA);
-    DrawGrid(20, 1.0f);
+    DrawGrid(200, 5.0f); // 1 km across so there's still ground to see at flying speed
 }
 
 void end() {

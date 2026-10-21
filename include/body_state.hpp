@@ -16,12 +16,12 @@ enum IDX {
 
 };
 
-struct State {
+struct BodyState {
     // state layout is the same as B.6
     // [pn pe pd | u v w | e0 e1 e2 e3 | p q r]
     StateVector state = StateVector::Zero();
 
-    State() {
+    BodyState() {
         state.setZero();
         quat() << 1.0, 0.0, 0.0, 0.0;
     }

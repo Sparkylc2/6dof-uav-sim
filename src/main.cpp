@@ -1,9 +1,10 @@
 // src/main.cpp
 #include "body.hpp"
+#include "body_state.hpp"
 #include "body_system.hpp"
 #include "frames.hpp"
 #include "render/render.hpp"
-#include "state.hpp"
+#include "world.hpp"
 #include <Eigen/Dense>
 #include <cmath>
 #include <raylib.h>
@@ -14,29 +15,56 @@ int main() {
 
     uav::rendering::init_rendering();
     uav::rendering::init_camera({-10.0, -6.0, -6.0}, {0, 0, 0}, {0, 0, -1}, 45.0);
-    Mesh mesh = GenMeshCube(0.25, 0.25, 0.25f);
+    // the mesh is in raylib axes: x_rl is body y (span), y_rl is -body z, z_rl is -body x (chord)
+    Mesh mesh = GenMeshCube(1.4224f, 0.05f, 0.3302f);
+    // a small fin on top so the roll and which way is up are visible
+    Mesh mesh_fin = GenMeshCube(0.02f, 0.15f, 0.2f);
 
     Model model = LoadModelFromMesh(mesh);
+    Model model_fin = LoadModelFromMesh(mesh_fin);
 
-    uav::BodySystem sys;
-    auto drone = std::make_unique<uav::Drone>();
-    uav::Drone &body = *drone;
-    sys.bodies.push_back(std::move(drone));
+    uav::World world;
+    auto plane = std::make_unique<uav::FixedWing>(generate_sport_drone());
+    uav::FixedWing &body = *plane;
+    world.bodies.bodies.push_back(std::move(plane));
+
+    // level flight trim at 20 m/s, found numerically by solving fx = fz = m = 0 with theta = alpha
+    // (for the zagi it was Va 18, alpha 0.071940, trim {-0.197314, 0, 0, 0.783290})
+    const double Va_trim = 20.0, alpha_trim = 0.011556;
+    body.trim = {-0.008667, 0.0, 0.0, 0.633204};
+
+    // starts 20 m up, flying north in trimmed level flight
+    auto start = [&body, Va_trim, alpha_trim]() {
+        body.state = uav::BodyState();
+        body.state.pos() = Vector3d(0.0, 0.0, -20.0);
+        body.state.quat() = euler_to_quat(0.0, alpha_trim, 0.0);
+        body.state.vel() =
+            Vector3d(Va_trim * std::cos(alpha_trim), 0.0, Va_trim * std::sin(alpha_trim));
+        body.controls = body.trim;
+    };
+    start();
 
     while (!WindowShouldClose()) {
         if (IsKeyPressed(KEY_R)) {
-            body.state = uav::State();
+            start();
         }
         if (IsKeyPressed(KEY_F)) {
             first_person = !first_person;
         }
-        body.read_keyboard();
+        if (IsKeyPressed(KEY_T)) {
+            world.atmosphere.turbulence = !world.atmosphere.turbulence;
+        }
         const double dt = GetFrameTime();
-        sys.step(dt);
+        body.read_keyboard(dt);
+        world.step(dt);
         const Eigen::Matrix3d R_b2i = rotation(body.state.quat());
 
         Matrix transform = rendering::to_rl_transform(R_b2i, body.state.pos());
         model.transform = transform;
+
+        // fin sits slightly behind the middle of the wing and above it (-z in body)
+        model_fin.transform =
+            rendering::to_rl_transform(R_b2i, body.state.pos() + R_b2i * Vector3d(-0.1, 0, -0.075));
 
         if (first_person) {
             rendering::CAMERA.position = rendering::ned_to_rl(body.state.pos());
@@ -45,11 +73,17 @@ int main() {
             rendering::CAMERA.up = rendering::ned_to_rl(R_b2i * Vector3d(0.0, 0.0, -1.0));
             rendering::CAMERA.fovy = 90.0f;
         } else {
-            uav::rendering::init_camera({-10.0, -6.0, -6.0}, {0, 0, 0}, {0, 0, -1}, 45.0);
+            // chase camera behind and above, follows the heading but not the roll or pitch
+            const double psi = quat_to_euler(body.state.quat()).z();
+            const Vector3d behind(-std::cos(psi), -std::sin(psi), 0.0);
+            const Vector3d pos = body.state.pos();
+            uav::rendering::init_camera(pos + 6.0 * behind + Vector3d(0, 0, -1.5), pos, {0, 0, -1},
+                                        45.0);
         }
 
         uav::rendering::begin();
         DrawModel(model, {0, 0, 0}, 1.0f, GRAY);
+        DrawModel(model_fin, {0, 0, 0}, 1.0f, DARKGRAY);
         uav::rendering::end();
     }
     CloseWindow();
